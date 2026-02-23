@@ -95,6 +95,9 @@ func GenerateRandomData(schema *Schema, plan Plan, fks []ForeignKey, cfg DataGen
 
 	// pre-compile CHECK constraints per table into AST (faster + cleaner errors)
 	checkAST := make(map[string][]checkNode)
+	// additionally: extract simple deterministic comparison rules from CHECKs
+	checkRules := make(map[string][]cmpRule)
+
 	for _, t := range plan.InsertOrder {
 		raw := schema.CheckConstraints[t]
 		if len(raw) == 0 {
@@ -109,6 +112,12 @@ func GenerateRandomData(schema *Schema, plan Plan, fks []ForeignKey, cfg DataGen
 			nodes = append(nodes, n)
 		}
 		checkAST[t] = nodes
+
+		// extract deterministic rules (e.g., end_time > start_time)
+		rules := extractCmpRules(nodes)
+		if len(rules) > 0 {
+			checkRules[t] = rules
+		}
 	}
 
 	// Generiši redove po InsertOrder
@@ -163,6 +172,11 @@ func GenerateRandomData(schema *Schema, plan Plan, fks []ForeignKey, cfg DataGen
 						return nil, fmt.Errorf("value gen error for %s.%s: %w", tableName, c.Name, err)
 					}
 					row[c.Name] = val
+				}
+
+				// 1.5) deterministically enforce simple CHECK relations like end_time > start_time
+				if rules := checkRules[tableName]; len(rules) > 0 {
+					applyDeterministicRules(rng, schema, tableName, tbl, row, rules)
 				}
 
 				// 2) CHECK constraints (dinamički)
@@ -878,9 +892,6 @@ func (p *parser) parseValue() (valueNode, error) {
 	case tIdent:
 		t := p.cur
 		p.cur = p.l.next()
-		// handle qualified idents like public.table.column -> normalizeIdent already kept last part when used elsewhere,
-		// but here lexer gives normalizeIdent(raw) which strips schema/table if dot exists.
-		// still: if dot remains, normalizeIdent will keep last part.
 		return valueNode{kind: vkIdent, lit: normalizeIdent(t.lit)}, nil
 	case tString:
 		t := p.cur
@@ -898,7 +909,6 @@ func (p *parser) parseValue() (valueNode, error) {
 		p.cur = p.l.next()
 		return valueNode{kind: vkNull, lit: "NULL"}, nil
 	case tLParen:
-		// shouldn't happen here; caller handles groups
 		return valueNode{}, fmt.Errorf("unexpected '(' in value")
 	default:
 		return valueNode{}, fmt.Errorf("unexpected token in value: %v (%s)", p.cur.typ, p.cur.lit)
@@ -1290,4 +1300,439 @@ func evalCheck(ast checkNode, schema *Schema, table string, row map[string]strin
 		return true, false, nil
 	}
 	return false, false, nil
+}
+
+// ==========================
+// NEW: Deterministic CHECK enforcement for time/date/timestamp/numbers
+// ==========================
+
+type cmpRule struct {
+	leftCol  string
+	rightCol string
+	op       tokenType
+}
+
+// Extract only simple comparisons where both sides are identifiers: a > b, a >= b, a < b, a <= b
+func extractCmpRules(nodes []checkNode) []cmpRule {
+	var rules []cmpRule
+	for _, n := range nodes {
+		collectCmpRules(n, &rules)
+	}
+	// keep only supported ops
+	out := rules[:0]
+	for _, r := range rules {
+		switch r.op {
+		case tGt, tGte, tLt, tLte:
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func collectCmpRules(n checkNode, out *[]cmpRule) {
+	switch x := n.(type) {
+	case *binNode:
+		collectCmpRules(x.l, out)
+		collectCmpRules(x.r, out)
+	case *notNode:
+		collectCmpRules(x.n, out)
+	case *cmpNode:
+		if x.l.kind == vkIdent && x.r.kind == vkIdent {
+			*out = append(*out, cmpRule{
+				leftCol:  normalizeIdent(x.l.lit),
+				rightCol: normalizeIdent(x.r.lit),
+				op:       x.op,
+			})
+		}
+	case *isNullNode:
+		// ignore
+	case *truthyNode:
+		// ignore
+	default:
+		// ignore
+	}
+}
+
+// Apply deterministic adjustments so that rules become satisfied without "guessing" retries.
+func applyDeterministicRules(rng *rand.Rand, schema *Schema, table string, tbl *Table, row map[string]string, rules []cmpRule) {
+	colType := make(map[string]string, len(tbl.Columns))
+	colNotNull := make(map[string]bool, len(tbl.Columns))
+	for _, c := range tbl.Columns {
+		colType[c.Name] = strings.ToLower(c.Type)
+		colNotNull[c.Name] = c.NotNull
+	}
+
+	// We can apply multiple rules; iterate a few times to settle dependencies.
+	for iter := 0; iter < 3; iter++ {
+		changed := false
+		for _, r := range rules {
+			lt, lok := colType[r.leftCol]
+			rt, rok := colType[r.rightCol]
+			if !lok || !rok {
+				continue
+			}
+
+			// If either side is NULL and it is allowed, leave it (CHECK becomes UNKNOWN -> pass).
+			// But if NOT NULL, we must ensure a concrete value.
+			lSql := strings.TrimSpace(row[r.leftCol])
+			rSql := strings.TrimSpace(row[r.rightCol])
+
+			lIsNull := (lSql == "" || lSql == "NULL")
+			rIsNull := (rSql == "" || rSql == "NULL")
+
+			if lIsNull && colNotNull[r.leftCol] {
+				// generate a base value if missing
+				row[r.leftCol] = deterministicBaseValueForType(rng, lt)
+				lSql = row[r.leftCol]
+				lIsNull = false
+				changed = true
+			}
+			if rIsNull && colNotNull[r.rightCol] {
+				row[r.rightCol] = deterministicBaseValueForType(rng, rt)
+				rSql = row[r.rightCol]
+				rIsNull = false
+				changed = true
+			}
+
+			// If still NULL on any side -> cannot enforce (nullable); skip.
+			if lIsNull || rIsNull {
+				continue
+			}
+
+			// Resolve raw scalar strings
+			lRaw := stripQuotesForRegistry(lSql)
+			rRaw := stripQuotesForRegistry(rSql)
+
+			// If already satisfies, continue
+			cmp, ok, _ := compareScalar(lRaw, rRaw)
+			if ok && ruleSatisfied(r.op, cmp) {
+				continue
+			}
+
+			// Enforce by setting one side relative to the other.
+			// Strategy:
+			// - For tGt/tGte: ensure left >=(>) right by adjusting left.
+			// - For tLt/tLte: ensure left <=(<) right by adjusting right (or left).
+			switch r.op {
+			case tGt:
+				newLeft, ok2 := makeGreater(rng, lt, lRaw, rt, rRaw, true)
+				if ok2 {
+					row[r.leftCol] = newLeft
+					changed = true
+				}
+			case tGte:
+				newLeft, ok2 := makeGreater(rng, lt, lRaw, rt, rRaw, false)
+				if ok2 {
+					row[r.leftCol] = newLeft
+					changed = true
+				}
+			case tLt:
+				// left < right -> easiest: push right above left
+				newRight, ok2 := makeRightGreaterThanLeft(rng, rt, rRaw, lt, lRaw, true)
+				if ok2 {
+					row[r.rightCol] = newRight
+					changed = true
+				}
+			case tLte:
+				newRight, ok2 := makeRightGreaterThanLeft(rng, rt, rRaw, lt, lRaw, false)
+				if ok2 {
+					row[r.rightCol] = newRight
+					changed = true
+				}
+			}
+		}
+		if !changed {
+			return
+		}
+	}
+}
+
+func ruleSatisfied(op tokenType, cmp int) bool {
+	switch op {
+	case tGt:
+		return cmp > 0
+	case tGte:
+		return cmp >= 0
+	case tLt:
+		return cmp < 0
+	case tLte:
+		return cmp <= 0
+	default:
+		return true
+	}
+}
+
+func deterministicBaseValueForType(rng *rand.Rand, typLower string) string {
+	switch typLower {
+	case "time without time zone":
+		// Choose something safe not near the end of day to allow "greater" adjustments.
+		sec := rng.Intn(20*3600 + 1) // up to 20:00:00
+		return "'" + formatTimeOnly(sec) + "'"
+	case "timestamp without time zone":
+		// Past within 30 days
+		t := time.Now().Add(-time.Duration(rng.Intn(30*24*3600+1)) * time.Second)
+		return "'" + t.Format("2006-01-02 15:04:05") + "'"
+	case "date":
+		d := time.Now().AddDate(0, 0, -rng.Intn(365))
+		return "'" + d.Format("2006-01-02") + "'"
+	case "integer", "int", "int4":
+		return strconv.Itoa(rng.Intn(5000))
+	case "bigint", "int8":
+		return strconv.FormatInt(int64(rng.Intn(2000000)), 10)
+	case "double precision", "float8":
+		v := rng.Float64() * 1000.0
+		return strconv.FormatFloat(v, 'f', 6, 64)
+	default:
+		// fallback: text
+		return "'" + randomText(rng, 6, 14) + "'"
+	}
+}
+
+func makeGreater(rng *rand.Rand, leftType string, leftRaw string, rightType string, rightRaw string, strict bool) (newLeftSQL string, ok bool) {
+	// We set LEFT relative to RIGHT. Ignore current LEFT and compute a new one.
+	switch leftType {
+	case "time without time zone":
+		rSec, err := parseTimeOnly(rightRaw)
+		if err != nil {
+			return "", false
+		}
+		minAdd := 0
+		if strict {
+			minAdd = 1
+		}
+		// ensure there's room; cap at 23:59:59
+		if rSec >= 86399 {
+			// force right down a bit by returning 23:59:59 as left if strict impossible -> but still not >.
+			// Better: set left to 23:59:59 and hope right is less; if right is 23:59:59, strict impossible without wrap.
+			if strict {
+				// fallback: set right effectively earlier by setting left to 23:59:59 and caller will re-evaluate;
+				// but strict would still fail. So instead: set left to 23:59:58, and right should be <= 23:59:57 in valid data.
+				// Here we cannot change right in this function; return false so outer can maybe fix in another rule direction.
+				return "", false
+			}
+			return "'" + formatTimeOnly(86399) + "'", true
+		}
+		maxAdd := 86399 - rSec
+		add := minAdd
+		if maxAdd > minAdd {
+			// pick deterministic delta, but always at least minAdd
+			add = minAdd + rng.Intn(maxAdd-minAdd+1)
+		}
+		lSec := rSec + add
+		if strict && lSec == rSec {
+			if lSec < 86399 {
+				lSec++
+			} else {
+				return "", false
+			}
+		}
+		return "'" + formatTimeOnly(lSec) + "'", true
+
+	case "timestamp without time zone":
+		rT, err := parseTimestamp(rightRaw)
+		if err != nil {
+			return "", false
+		}
+		minAdd := 0
+		if strict {
+			minAdd = 1
+		}
+		// add between minAdd and 8 hours
+		addSec := minAdd
+		if 8*3600 > minAdd {
+			addSec = minAdd + rng.Intn(8*3600-minAdd+1)
+		}
+		lT := rT.Add(time.Duration(addSec) * time.Second)
+		if strict && lT.Equal(rT) {
+			lT = lT.Add(1 * time.Second)
+		}
+		return "'" + lT.Format("2006-01-02 15:04:05") + "'", true
+
+	case "date":
+		rD, err := parseDate(rightRaw)
+		if err != nil {
+			return "", false
+		}
+		minAdd := 0
+		if strict {
+			minAdd = 1
+		}
+		addDays := minAdd
+		if 30 > minAdd {
+			addDays = minAdd + rng.Intn(30-minAdd+1)
+		}
+		lD := rD.AddDate(0, 0, addDays)
+		if strict && lD.Equal(rD) {
+			lD = lD.AddDate(0, 0, 1)
+		}
+		return "'" + lD.Format("2006-01-02") + "'", true
+
+	case "integer", "int", "int4":
+		rv, err := strconv.ParseInt(rightRaw, 10, 64)
+		if err != nil {
+			return "", false
+		}
+		d := int64(0)
+		if strict {
+			d = 1
+		}
+		d += int64(rng.Intn(10)) // small bump
+		return strconv.FormatInt(rv+d, 10), true
+
+	case "bigint", "int8":
+		rv, err := strconv.ParseInt(rightRaw, 10, 64)
+		if err != nil {
+			return "", false
+		}
+		d := int64(0)
+		if strict {
+			d = 1
+		}
+		d += int64(rng.Intn(50))
+		return strconv.FormatInt(rv+d, 10), true
+
+	case "double precision", "float8":
+		rv, err := strconv.ParseFloat(rightRaw, 64)
+		if err != nil {
+			return "", false
+		}
+		d := 0.0
+		if strict {
+			d = 0.000001
+		}
+		d += rng.Float64() * 10.0
+		return strconv.FormatFloat(rv+d, 'f', 6, 64), true
+	default:
+		// unsupported type for deterministic enforcement
+		_ = leftRaw
+		_ = rightType
+		return "", false
+	}
+}
+
+// For rules left < right, we push RIGHT above LEFT.
+func makeRightGreaterThanLeft(rng *rand.Rand, rightType string, rightRaw string, leftType string, leftRaw string, strict bool) (newRightSQL string, ok bool) {
+	switch rightType {
+	case "time without time zone":
+		lSec, err := parseTimeOnly(leftRaw)
+		if err != nil {
+			return "", false
+		}
+		minAdd := 0
+		if strict {
+			minAdd = 1
+		}
+		if lSec >= 86399 {
+			// cannot make right > left if left is max time
+			if strict {
+				return "", false
+			}
+			return "'" + formatTimeOnly(86399) + "'", true
+		}
+		maxAdd := 86399 - lSec
+		add := minAdd
+		if maxAdd > minAdd {
+			add = minAdd + rng.Intn(maxAdd-minAdd+1)
+		}
+		rSec := lSec + add
+		if strict && rSec == lSec {
+			if rSec < 86399 {
+				rSec++
+			} else {
+				return "", false
+			}
+		}
+		return "'" + formatTimeOnly(rSec) + "'", true
+
+	case "timestamp without time zone":
+		lT, err := parseTimestamp(leftRaw)
+		if err != nil {
+			return "", false
+		}
+		minAdd := 0
+		if strict {
+			minAdd = 1
+		}
+		addSec := minAdd
+		if 8*3600 > minAdd {
+			addSec = minAdd + rng.Intn(8*3600-minAdd+1)
+		}
+		rT := lT.Add(time.Duration(addSec) * time.Second)
+		if strict && rT.Equal(lT) {
+			rT = rT.Add(1 * time.Second)
+		}
+		return "'" + rT.Format("2006-01-02 15:04:05") + "'", true
+
+	case "date":
+		lD, err := parseDate(leftRaw)
+		if err != nil {
+			return "", false
+		}
+		minAdd := 0
+		if strict {
+			minAdd = 1
+		}
+		addDays := minAdd
+		if 30 > minAdd {
+			addDays = minAdd + rng.Intn(30-minAdd+1)
+		}
+		rD := lD.AddDate(0, 0, addDays)
+		if strict && rD.Equal(lD) {
+			rD = rD.AddDate(0, 0, 1)
+		}
+		return "'" + rD.Format("2006-01-02") + "'", true
+
+	case "integer", "int", "int4":
+		lv, err := strconv.ParseInt(leftRaw, 10, 64)
+		if err != nil {
+			return "", false
+		}
+		d := int64(0)
+		if strict {
+			d = 1
+		}
+		d += int64(rng.Intn(10))
+		return strconv.FormatInt(lv+d, 10), true
+
+	case "bigint", "int8":
+		lv, err := strconv.ParseInt(leftRaw, 10, 64)
+		if err != nil {
+			return "", false
+		}
+		d := int64(0)
+		if strict {
+			d = 1
+		}
+		d += int64(rng.Intn(50))
+		return strconv.FormatInt(lv+d, 10), true
+
+	case "double precision", "float8":
+		lv, err := strconv.ParseFloat(leftRaw, 64)
+		if err != nil {
+			return "", false
+		}
+		d := 0.0
+		if strict {
+			d = 0.000001
+		}
+		d += rng.Float64() * 10.0
+		return strconv.FormatFloat(lv+d, 'f', 6, 64), true
+	default:
+		_ = rightRaw
+		_ = leftType
+		return "", false
+	}
+}
+
+func formatTimeOnly(sec int) string {
+	if sec < 0 {
+		sec = 0
+	}
+	if sec > 86399 {
+		sec = 86399
+	}
+	h := sec / 3600
+	m := (sec % 3600) / 60
+	s := sec % 60
+	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
 }
