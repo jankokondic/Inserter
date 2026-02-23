@@ -1,0 +1,8 @@
+Generisi 10 redova za svaku tabelu
+go run . --out out.sql --rows 10 ./schema.sql
+
+Ili ako ciljaš jednu tabelu:
+go run . --table visit_service_item --rows 10 --out out.sql ./schema.sql
+
+Ako želiš deterministički output:
+go run . --out out.sql --rows 10 --seed 123 ./schema.sql
