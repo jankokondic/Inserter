@@ -38,6 +38,13 @@ func main() {
 
 	sort.Strings(allTables)
 
+	fmt.Println("\nUnique constraints for additional_information_business:")
+	ucs := schema.UniqueConstraints["additional_information_business"]
+	fmt.Println("count:", len(ucs))
+	for i, uc := range ucs {
+		fmt.Printf("  %d) %v\n", i+1, uc)
+	}
+
 	fmt.Println("Tables:", len(allTables))
 	fmt.Println("FKs:", len(fks))
 	fmt.Println("Enums:", len(schema.Enums))

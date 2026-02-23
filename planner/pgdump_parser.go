@@ -30,9 +30,12 @@ type Schema struct {
 	// table -> list of unique constraints; each constraint = list of column names
 	// PRIMARY KEY takođe ulazi ovdje.
 	UniqueConstraints map[string][][]string
+
+	// table -> list of CHECK expressions (raw SQL inside CHECK(...))
+	CheckConstraints map[string][]string
 }
 
-// ParsePgDumpAll: enums + tables/columns + fks + unique constraints iz pg_dump fajla.
+// ParsePgDumpAll: enums + tables/columns + fks + unique constraints + check constraints iz pg_dump fajla.
 // KLJUČNO: preskače COPY ... FROM stdin; blokove (do linije \.)
 func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 	f, err := os.Open(path)
@@ -45,6 +48,7 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 		Enums:             make(map[string][]string),
 		Tables:            make(map[string]*Table),
 		UniqueConstraints: make(map[string][][]string),
+		CheckConstraints:  make(map[string][]string),
 	}
 
 	// ===== regexi =====
@@ -63,6 +67,9 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 	// PK / UNIQUE
 	reAlterPK := regexp.MustCompile(`(?i)^\s*ALTER\s+TABLE\s+(?:ONLY\s+)?(.+?)\s+ADD\s+CONSTRAINT\s+.+?\bPRIMARY\s+KEY\s*\(\s*([^)]+?)\s*\)`)
 	reAlterUnique := regexp.MustCompile(`(?i)^\s*ALTER\s+TABLE\s+(?:ONLY\s+)?(.+?)\s+ADD\s+CONSTRAINT\s+.+?\bUNIQUE\s*\(\s*([^)]+?)\s*\)`)
+
+	// CHECK (ALTER TABLE ... ADD CONSTRAINT ... CHECK (...))
+	reAlterCheckPrefix := regexp.MustCompile(`(?i)^\s*ALTER\s+TABLE\s+(?:ONLY\s+)?(.+?)\s+ADD\s+CONSTRAINT\s+.+?\bCHECK\b`)
 
 	// ===== state =====
 	tableSet := map[string]struct{}{}
@@ -114,10 +121,26 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 		schema.Tables[tname] = t
 	}
 
-	// COPY block state (BITNO!)
+	// CHECK parsing inside CREATE TABLE may span lines
+	inCreateCheck := false
+	createCheckDepth := 0
+	var createCheckBuf strings.Builder
+
+	addCheck := func(table string, expr string) {
+		t := normalizeIdent(table)
+		expr = strings.TrimSpace(expr)
+		expr = strings.TrimSuffix(expr, ",")
+		expr = strings.TrimSpace(expr)
+		if t == "" || expr == "" {
+			return
+		}
+		schema.CheckConstraints[t] = append(schema.CheckConstraints[t], expr)
+	}
+
+	// COPY block state
 	inCopy := false
 
-	// statement buffer za ALTER TABLE i ostale ';' statemente
+	// statement buffer for ';' terminated statements
 	var stmtBuf strings.Builder
 
 	// FK list
@@ -128,14 +151,14 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 		if t == "" {
 			return
 		}
-		cols := splitCols(rawCols)
-		if len(cols) == 0 {
+		colsU := splitCols(rawCols)
+		if len(colsU) == 0 {
 			return
 		}
-		for i := range cols {
-			cols[i] = normalizeIdent(cols[i])
+		for i := range colsU {
+			colsU[i] = normalizeIdent(colsU[i])
 		}
-		schema.UniqueConstraints[t] = append(schema.UniqueConstraints[t], cols)
+		schema.UniqueConstraints[t] = append(schema.UniqueConstraints[t], colsU)
 	}
 
 	processStatement := func(stmt string) {
@@ -147,10 +170,9 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 		stmtNorm := normalizeWhitespace(stmt)
 		up := strings.ToUpper(stmtNorm)
 
-		// uhvati ALTER TABLE <t> da se pojavi kao table čvor
+		// ALTER TABLE [ONLY] <table>
 		if strings.HasPrefix(up, "ALTER TABLE") {
 			parts := strings.Fields(stmtNorm)
-			// ALTER TABLE [ONLY] <table> ...
 			if len(parts) >= 3 {
 				idx := 2
 				if len(parts) >= 4 && strings.EqualFold(parts[2], "ONLY") {
@@ -171,6 +193,18 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 		if m := reAlterUnique.FindStringSubmatch(stmtNorm); m != nil {
 			addUnique(m[1], m[2])
 			flushTableSeen(m[1])
+			return
+		}
+
+		// CHECK
+		if m := reAlterCheckPrefix.FindStringSubmatch(stmtNorm); m != nil && strings.Contains(up, " CHECK") {
+			tbl := normalizeIdent(m[1])
+			flushTableSeen(tbl)
+
+			expr, ok := extractCheckExprFromStatement(stmtNorm)
+			if ok {
+				addCheck(tbl, expr)
+			}
 			return
 		}
 
@@ -261,16 +295,9 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 		}
 
 		// START COPY blok
-		// primjer: COPY public.additional_information (id, name, icon) FROM stdin;
 		if strings.HasPrefix(strings.ToUpper(trim), "COPY ") && strings.Contains(strings.ToUpper(trim), " FROM STDIN") {
 			inCopy = true
-			// BITNO: očisti stmtBuf da COPY ne kontaminira naredne ALTER TABLE statement-e
 			stmtBuf.Reset()
-			continue
-		}
-
-		// extra sigurnost: standalone \. (ne bi trebalo doći ovdje jer inCopy hvata)
-		if trim == `\.` {
 			continue
 		}
 
@@ -305,9 +332,33 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 				cols = cols[:0]
 
 				flushTableSeen(tableNameRaw)
+
+				// reset CHECK state
+				inCreateCheck = false
+				createCheckDepth = 0
+				createCheckBuf.Reset()
+
 				continue
 			}
 		} else {
+			// multi-line CHECK inside CREATE TABLE
+			if inCreateCheck {
+				createCheckBuf.WriteString("\n")
+				createCheckBuf.WriteString(line)
+
+				createCheckDepth += parenDelta(line)
+				if createCheckDepth <= 0 {
+					inCreateCheck = false
+					expr, ok := extractCheckExprFromCreateBlock(createCheckBuf.String())
+					if ok {
+						addCheck(normalizeIdent(tableNameRaw), expr)
+					}
+					createCheckBuf.Reset()
+					createCheckDepth = 0
+				}
+				continue
+			}
+
 			// kraj create table bloka
 			if strings.HasPrefix(trim, ");") || trim == ");" || trim == ")" || strings.HasPrefix(trim, ")") {
 				inCreate = false
@@ -318,15 +369,34 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 			}
 
 			up := strings.ToUpper(trim)
-			// preskoči constraint linije unutar CREATE TABLE
+
+			// CHECK constraints inside CREATE TABLE
+			if strings.Contains(up, "CHECK") && (strings.HasPrefix(up, "CONSTRAINT ") || strings.HasPrefix(up, "CHECK ")) {
+				inCreateCheck = true
+				createCheckBuf.Reset()
+				createCheckBuf.WriteString(line)
+				createCheckDepth = parenDelta(line)
+				if createCheckDepth <= 0 {
+					inCreateCheck = false
+					expr, ok := extractCheckExprFromCreateBlock(createCheckBuf.String())
+					if ok {
+						addCheck(normalizeIdent(tableNameRaw), expr)
+					}
+					createCheckBuf.Reset()
+					createCheckDepth = 0
+				}
+				continue
+			}
+
+			// preskoči constraint linije unutar CREATE TABLE koje nisu CHECK
 			if strings.HasPrefix(up, "CONSTRAINT ") ||
 				strings.HasPrefix(up, "PRIMARY KEY") ||
 				strings.HasPrefix(up, "UNIQUE ") ||
-				strings.HasPrefix(up, "CHECK ") ||
 				strings.HasPrefix(up, "FOREIGN KEY") {
 				continue
 			}
 
+			// column line
 			m := reColLine.FindStringSubmatch(line)
 			if m == nil {
 				continue
@@ -382,7 +452,6 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 		}
 
 		// ===== Statement parsing (ALTER TABLE ... ; ) =====
-		// Multi-line: skupljaj sve dok ne naiđe ';'
 		parts := strings.Split(line, ";")
 		for i := 0; i < len(parts); i++ {
 			part := parts[i]
@@ -409,6 +478,16 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 
 	// dedupe FK
 	fks = dedupeFKs(fks)
+
+	// dedupe UNIQUE constraints (može pg_dump duplirati)
+	for t, list := range schema.UniqueConstraints {
+		schema.UniqueConstraints[t] = dedupeUniqueList(list)
+	}
+
+	// dedupe CHECK constraints
+	for t, list := range schema.CheckConstraints {
+		schema.CheckConstraints[t] = dedupeStringList(list)
+	}
 
 	// allTables
 	allTables := make([]string, 0, len(tableSet))
@@ -509,4 +588,143 @@ func dedupeFKs(in []ForeignKey) []ForeignKey {
 		out = append(out, fk)
 	}
 	return out
+}
+
+func dedupeStringList(in []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		k := normalizeWhitespace(strings.TrimSpace(s))
+		if k == "" {
+			continue
+		}
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+// dedupeUniqueList: input je [][]string (lista constraint-a; svaki constraint je lista kolona)
+func dedupeUniqueList(in [][]string) [][]string {
+	seen := map[string]struct{}{}
+	out := make([][]string, 0, len(in))
+	for _, cols := range in {
+		key := strings.Join(cols, ",")
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		cp := make([]string, len(cols))
+		copy(cp, cols)
+		out = append(out, cp)
+	}
+	return out
+}
+
+// ---------- CHECK extraction helpers ----------
+
+func extractCheckExprFromStatement(stmt string) (string, bool) {
+	up := strings.ToUpper(stmt)
+	idx := strings.Index(up, "CHECK")
+	if idx < 0 {
+		return "", false
+	}
+	rest := stmt[idx:]
+	p := strings.Index(rest, "(")
+	if p < 0 {
+		return "", false
+	}
+	start := idx + p
+	expr, ok := extractBalancedInsideParens(stmt, start)
+	return expr, ok
+}
+
+func extractCheckExprFromCreateBlock(block string) (string, bool) {
+	up := strings.ToUpper(block)
+	idx := strings.Index(up, "CHECK")
+	if idx < 0 {
+		return "", false
+	}
+	rest := block[idx:]
+	p := strings.Index(rest, "(")
+	if p < 0 {
+		return "", false
+	}
+	start := idx + p
+	return extractBalancedInsideParens(block, start)
+}
+
+func extractBalancedInsideParens(s string, startIdx int) (string, bool) {
+	if startIdx < 0 || startIdx >= len(s) || s[startIdx] != '(' {
+		return "", false
+	}
+
+	depth := 0
+	inStr := false
+
+	for i := startIdx; i < len(s); i++ {
+		ch := s[i]
+
+		if inStr {
+			if ch == '\'' {
+				// doubled quotes '' inside string
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inStr = false
+			}
+			continue
+		}
+
+		if ch == '\'' {
+			inStr = true
+			continue
+		}
+
+		if ch == '(' {
+			depth++
+			continue
+		}
+		if ch == ')' {
+			depth--
+			if depth == 0 {
+				inside := s[startIdx+1 : i]
+				inside = strings.TrimSpace(inside)
+				return inside, true
+			}
+		}
+	}
+	return "", false
+}
+
+func parenDelta(s string) int {
+	d := 0
+	inStr := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inStr {
+			if ch == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inStr = false
+			}
+			continue
+		}
+		if ch == '\'' {
+			inStr = true
+			continue
+		}
+		if ch == '(' {
+			d++
+		} else if ch == ')' {
+			d--
+		}
+	}
+	return d
 }
