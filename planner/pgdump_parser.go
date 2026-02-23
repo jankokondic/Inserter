@@ -26,12 +26,14 @@ type Table struct {
 type Schema struct {
 	Enums  map[string][]string // enumName -> values
 	Tables map[string]*Table   // tableName -> Table
+
+	// table -> list of unique constraints; each constraint is list of column names.
+	// PRIMARY KEY se tretira kao UNIQUE constraint i biće upisan ovdje takođe.
+	UniqueConstraints map[string][][]string
 }
 
-// ForeignKey opisuje FK vezu: child.childColumn -> parent.parentColumn
-
 // ParsePgDumpAll u jednom prolazu iz pg_dump fajla vadi:
-// - schema (enums + tables + columns)
+// - schema (enums + tables + columns + unique constraints)
 // - allTables (sve tabele viđene u CREATE/ALTER)
 // - fks (FK-ovi iz inline REFERENCES i iz ALTER TABLE ... FOREIGN KEY ...)
 // Radi sa multi-line ALTER TABLE iz pg_dump.
@@ -43,8 +45,9 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 	defer f.Close()
 
 	schema := &Schema{
-		Enums:  make(map[string][]string),
-		Tables: make(map[string]*Table),
+		Enums:             make(map[string][]string),
+		Tables:            make(map[string]*Table),
+		UniqueConstraints: make(map[string][][]string),
 	}
 
 	// ===== regexi =====
@@ -56,7 +59,7 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 	// column line (uzimamo samo prvi ident, a ostatak "rest")
 	reColLine := regexp.MustCompile(`^\s*("?[\w]+"?)\s+(.+)$`)
 
-	// inline FK u CREATE TABLE liniji (rijetko, ali neka radi)
+	// inline FK u CREATE TABLE liniji
 	reInlineRef := regexp.MustCompile(`(?i)^\s*("?[\w]+"?)\s+.*\bREFERENCES\b\s+(.+?)\s*\(\s*("?[\w]+"?)\s*\)`)
 
 	// ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY (child_col) REFERENCES parent(parent_col)
@@ -64,6 +67,12 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 
 	// composite FK: FOREIGN KEY (a,b) REFERENCES parent(x,y)
 	reAlterFKComposite := regexp.MustCompile(`(?i)^\s*ALTER\s+TABLE\s+(?:ONLY\s+)?(.+?)\s+ADD\s+CONSTRAINT\s+.+?\bFOREIGN\s+KEY\s*\(\s*([^)]+?)\s*\)\s+REFERENCES\s+(.+?)\s*\(\s*([^)]+?)\s*\)`)
+
+	// PRIMARY KEY: ALTER TABLE ONLY x ADD CONSTRAINT ... PRIMARY KEY (a, b)
+	reAlterPK := regexp.MustCompile(`(?i)^\s*ALTER\s+TABLE\s+(?:ONLY\s+)?(.+?)\s+ADD\s+CONSTRAINT\s+.+?\bPRIMARY\s+KEY\s*\(\s*([^)]+?)\s*\)`)
+
+	// UNIQUE: ALTER TABLE ONLY x ADD CONSTRAINT ... UNIQUE (a, b)
+	reAlterUnique := regexp.MustCompile(`(?i)^\s*ALTER\s+TABLE\s+(?:ONLY\s+)?(.+?)\s+ADD\s+CONSTRAINT\s+.+?\bUNIQUE\s*\(\s*([^)]+?)\s*\)`)
 
 	// ===== state =====
 	tableSet := map[string]struct{}{}
@@ -107,7 +116,6 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 		if tname == "" {
 			return
 		}
-		// snimi tabelu u schema
 		t := &Table{
 			Name:    tname,
 			Columns: make([]Column, 0, len(cols)),
@@ -116,11 +124,27 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 		schema.Tables[tname] = t
 	}
 
-	// statement buffer za ALTER TABLE (jer je multi-line)
+	// statement buffer za ALTER TABLE (multi-line)
 	var stmtBuf strings.Builder
 
 	// FK list
 	fks := make([]ForeignKey, 0, 128)
+
+	// helper: dodaj unique constraint u schema.UniqueConstraints
+	addUnique := func(table string, rawCols string) {
+		t := normalizeIdent(table)
+		if t == "" {
+			return
+		}
+		cols := splitCols(rawCols)
+		if len(cols) == 0 {
+			return
+		}
+		for i := range cols {
+			cols[i] = normalizeIdent(cols[i])
+		}
+		schema.UniqueConstraints[t] = append(schema.UniqueConstraints[t], cols)
+	}
 
 	// helper: obradi završen statement (bez komentara)
 	processStatement := func(stmt string) {
@@ -143,6 +167,20 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 				}
 				flushTableSeen(parts[idx])
 			}
+		}
+
+		// PRIMARY KEY -> tretiraj kao UNIQUE constraint
+		if m := reAlterPK.FindStringSubmatch(stmtNorm); m != nil {
+			addUnique(m[1], m[2])
+			flushTableSeen(m[1])
+			return
+		}
+
+		// UNIQUE constraint
+		if m := reAlterUnique.FindStringSubmatch(stmtNorm); m != nil {
+			addUnique(m[1], m[2])
+			flushTableSeen(m[1])
+			return
 		}
 
 		// single-column FK
@@ -236,7 +274,6 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 			}
 		}
 		if inEnum {
-			// kraj enum definicije
 			if strings.HasPrefix(trim, ");") || trim == ");" || trim == ")" || strings.HasPrefix(trim, ")") {
 				inEnum = false
 				flushEnum()
@@ -297,7 +334,7 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 				HasDefault: hasDefault,
 			})
 
-			// popuni nullable map (da FK IsNullable bude tačan)
+			// popuni nullable map
 			tname := normalizeIdent(tableNameRaw)
 			if tname != "" {
 				if _, ok := nullable[tname]; !ok {
@@ -336,7 +373,6 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 		}
 
 		// ===== Statement parsing (ALTER TABLE ... ; ) =====
-		// Linija može imati više ';' -> split i flush svaki statement
 		parts := strings.Split(line, ";")
 		for i := 0; i < len(parts); i++ {
 			part := parts[i]
@@ -346,7 +382,6 @@ func ParsePgDumpAll(path string) (*Schema, []string, []ForeignKey, error) {
 			stmtBuf.WriteString("\n")
 
 			if !isLast {
-				// statement završen na ';'
 				processStatement(stmtBuf.String())
 				stmtBuf.Reset()
 			}

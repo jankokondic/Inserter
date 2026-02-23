@@ -44,7 +44,7 @@ type GeneratedData struct {
 func FillFKNullability(schema *Schema, fks []ForeignKey) []ForeignKey {
 	out := make([]ForeignKey, 0, len(fks))
 	for _, fk := range fks {
-		isNullable := fk.IsNullable // ako već ima, ali ga možemo prepisati
+		isNullable := fk.IsNullable
 		t := schema.Tables[fk.ChildTable]
 		if t != nil {
 			for _, c := range t.Columns {
@@ -62,6 +62,7 @@ func FillFKNullability(schema *Schema, fks []ForeignKey) []ForeignKey {
 
 // GenerateRandomData generiše INSERT podatke tako da FK-ovi budu validni.
 // Radi po plan.InsertOrder (parent prije child).
+// NOVO: enforce unique/PK constraint-e iz schema.UniqueConstraints da izbjegnemo duplikate.
 func GenerateRandomData(schema *Schema, plan Plan, fks []ForeignKey, cfg DataGenConfig) (*GeneratedData, error) {
 	if cfg.DefaultRows <= 0 {
 		cfg.DefaultRows = 10
@@ -91,7 +92,6 @@ func GenerateRandomData(schema *Schema, plan Plan, fks []ForeignKey, cfg DataGen
 	}
 
 	registerValue := func(table, col, sqlLit string) {
-		// registry vrijednost: bez SQL navodnika
 		v := stripQuotesForRegistry(sqlLit)
 		if v == "NULL" {
 			return
@@ -106,7 +106,6 @@ func GenerateRandomData(schema *Schema, plan Plan, fks []ForeignKey, cfg DataGen
 	for _, tableName := range plan.InsertOrder {
 		tbl := schema.Tables[tableName]
 		if tbl == nil {
-			// Ako parser nije uhvatio CREATE TABLE za neku tabelu, preskoči.
 			continue
 		}
 
@@ -121,29 +120,78 @@ func GenerateRandomData(schema *Schema, plan Plan, fks []ForeignKey, cfg DataGen
 			fkColMap[fk.ChildColumn] = fk
 		}
 
+		// Unique constraints for this table (PK + UNIQUE)
+		ucList := schema.UniqueConstraints[tableName]
+		seen := make([]map[string]struct{}, len(ucList))
+		for i := range seen {
+			seen[i] = make(map[string]struct{})
+		}
+
 		rows := make([]map[string]string, 0, n)
 
 		for i := 0; i < n; i++ {
-			row := make(map[string]string, len(tbl.Columns))
+			const maxAttempts = 2000
 
-			for _, c := range tbl.Columns {
-				// FK kolona?
-				if fk, ok := fkColMap[c.Name]; ok {
-					val, err := pickFKValue(rng, out, fk, cfg.NullableFKNullRate)
+			var row map[string]string
+			okRow := false
+
+			for attempt := 0; attempt < maxAttempts; attempt++ {
+				row = make(map[string]string, len(tbl.Columns))
+
+				for _, c := range tbl.Columns {
+					// FK kolona?
+					if fk, ok := fkColMap[c.Name]; ok {
+						val, err := pickFKValue(rng, out, fk, cfg.NullableFKNullRate)
+						if err != nil {
+							return nil, fmt.Errorf("FK value error for %s.%s: %w", tableName, c.Name, err)
+						}
+						row[c.Name] = val
+						continue
+					}
+
+					val, err := randomValueForColumn(rng, schema, tableName, c)
 					if err != nil {
-						return nil, fmt.Errorf("FK value error for %s.%s: %w", tableName, c.Name, err)
+						return nil, fmt.Errorf("value gen error for %s.%s: %w", tableName, c.Name, err)
 					}
 					row[c.Name] = val
-					registerValue(tableName, c.Name, val)
+				}
+
+				// enforce UNIQUE/PK
+				conflict := false
+				for idx, cols := range ucList {
+					k, ok := uniqueKeyForRow(row, cols)
+					if !ok {
+						continue
+					}
+					if _, exists := seen[idx][k]; exists {
+						conflict = true
+						break
+					}
+				}
+				if conflict {
 					continue
 				}
 
-				val, err := randomValueForColumn(rng, schema, tableName, c)
-				if err != nil {
-					return nil, fmt.Errorf("value gen error for %s.%s: %w", tableName, c.Name, err)
+				// reserve keys
+				for idx, cols := range ucList {
+					k, ok := uniqueKeyForRow(row, cols)
+					if !ok {
+						continue
+					}
+					seen[idx][k] = struct{}{}
 				}
-				row[c.Name] = val
-				registerValue(tableName, c.Name, val)
+
+				okRow = true
+				break
+			}
+
+			if !okRow {
+				return nil, fmt.Errorf("could not generate unique row for table %s after many attempts; reduce rows or increase parent rows", tableName)
+			}
+
+			// tek sad registruj vrijednosti (da FK biranje radi, a da retry ne zagađuje registry)
+			for _, c := range tbl.Columns {
+				registerValue(tableName, c.Name, row[c.Name])
 			}
 
 			rows = append(rows, row)
@@ -159,10 +207,6 @@ func GenerateRandomData(schema *Schema, plan Plan, fks []ForeignKey, cfg DataGen
 // Uključuje samo tabele koje imaju generisane redove.
 func RenderInserts(schema *Schema, plan Plan, data *GeneratedData) string {
 	var b strings.Builder
-
-	// opcionalno: isključi trigger-e/constraints tokom importa (ne mora, ali može pomoći)
-	// b.WriteString("BEGIN;\n")
-	// b.WriteString("SET session_replication_role = replica;\n\n")
 
 	for _, table := range plan.InsertOrder {
 		rows := data.Rows[table]
@@ -208,9 +252,6 @@ func RenderInserts(schema *Schema, plan Plan, data *GeneratedData) string {
 		b.WriteString("\n")
 	}
 
-	// b.WriteString("SET session_replication_role = origin;\n")
-	// b.WriteString("COMMIT;\n")
-
 	return b.String()
 }
 
@@ -255,6 +296,30 @@ func computeRequiredRows(plan Plan, fks []ForeignKey, cfg DataGenConfig) map[str
 	}
 
 	return required
+}
+
+// ==========================
+// INTERNALS: UNIQUE/PK KEYING
+// ==========================
+
+// uniqueKeyForRow pravi stabilan ključ iz vrijednosti navedenih kolona.
+// Vraća ok=false ako neka kolona fali ili je NULL.
+// Napomena: UNIQUE u Postgresu dozvoljava više NULL-ova, pa NULL kombinacije ne enforce-amo.
+// PRIMARY KEY kolone su NOT NULL, pa će tu ok biti true.
+func uniqueKeyForRow(row map[string]string, cols []string) (key string, ok bool) {
+	parts := make([]string, 0, len(cols))
+	for _, c := range cols {
+		v, exists := row[c]
+		if !exists {
+			return "", false
+		}
+		v = strings.TrimSpace(v)
+		if v == "NULL" {
+			return "", false
+		}
+		parts = append(parts, stripQuotesForRegistry(v))
+	}
+	return strings.Join(parts, "|"), true
 }
 
 // ==========================
@@ -459,7 +524,5 @@ type writeCloser interface {
 }
 
 func osCreateTrunc(path string) (writeCloser, error) {
-	// lokalno importanje os bi zahtijevalo dodatni import u ovom fajlu, ali već ga imamo gore.
-	// zato koristimo direktno os.Create ovdje kroz helper.
 	return os.Create(path)
 }
